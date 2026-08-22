@@ -139,7 +139,9 @@ pub(crate) async fn handle_approve_decision(
             .into_response();
     }
 
-    if let Some(resp) = decisions_access::reject_self_resolution(&decided_by, &decision) {
+    if let Some(resp) =
+        decisions_access::reject_self_resolution(&auth.security_context().principal, &decision)
+    {
         return resp;
     }
 
@@ -395,7 +397,9 @@ pub(crate) async fn handle_deny_decision(
             .into_response();
     }
 
-    if let Some(resp) = decisions_access::reject_self_resolution(&principal_id, &decision) {
+    if let Some(resp) =
+        decisions_access::reject_self_resolution(&auth.security_context().principal, &decision)
+    {
         return resp;
     }
 
