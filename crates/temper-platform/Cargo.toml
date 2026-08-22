@@ -41,3 +41,4 @@ tokio-test = { workspace = true }
 tower = { workspace = true }
 hyper = { workspace = true }
 wiremock = { workspace = true }
+tracing-subscriber = { workspace = true }

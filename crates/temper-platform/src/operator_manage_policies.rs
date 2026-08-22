@@ -65,6 +65,12 @@ fn live_tenant_policy_text(state: &PlatformState, tenant: &str) -> String {
 ///
 /// Idempotent: re-bootstrap does not duplicate the live statement or the
 /// granular row. Does not replace existing app Cedar.
+///
+/// `persist_and_activate_policy` returns `true` only when it wrote a new or
+/// changed row. `false` means hash-match (already durable), no store, or
+/// `save_policy` error. This seed claims success only when the write
+/// succeeded or the durable row is already present. Otherwise it logs
+/// failure and does not claim the grant survives restart.
 pub async fn seed_operator_manage_policies(state: &PlatformState, tenant: &str) {
     assert!(
         !tenant.is_empty() && !tenant.contains('"'),
@@ -93,7 +99,7 @@ pub async fn seed_operator_manage_policies(state: &PlatformState, tenant: &str) 
         policies.insert(tenant.to_string(), merged);
     }
 
-    persist_and_activate_policy(
+    let wrote = persist_and_activate_policy(
         &state.server,
         tenant,
         OPERATOR_MANAGE_POLICIES_POLICY_ID,
@@ -102,11 +108,88 @@ pub async fn seed_operator_manage_policies(state: &PlatformState, tenant: &str) 
     )
     .await;
 
-    tracing::info!(
+    if wrote || operator_bootstrap_row_is_durable(state, tenant).await {
+        tracing::info!(
+            tenant,
+            policy_id = OPERATOR_MANAGE_POLICIES_POLICY_ID,
+            "operator manage_policies Cedar permit seeded"
+        );
+        return;
+    }
+
+    let has_policy_store = state.server.policy_store().is_some();
+    if has_policy_store {
+        // Durable write failed after in-memory activation. Roll the engine
+        // back so this process does not hold a grant that recover_cedar_policies
+        // cannot rebuild.
+        restore_live_tenant_policy(state, tenant, &existing);
+        tracing::error!(
+            tenant,
+            policy_id = OPERATOR_MANAGE_POLICIES_POLICY_ID,
+            "operator manage_policies Cedar permit not persisted; will not survive restart"
+        );
+        return;
+    }
+
+    // No store: keep the process-local grant (same as other in-memory-only
+    // boots) but do not claim the row was seeded. Restart has nothing to recover.
+    tracing::error!(
         tenant,
         policy_id = OPERATOR_MANAGE_POLICIES_POLICY_ID,
-        "operator manage_policies Cedar permit seeded"
+        "operator manage_policies Cedar permit not persisted; no durable policy store"
     );
+}
+
+async fn operator_bootstrap_row_is_durable(state: &PlatformState, tenant: &str) -> bool {
+    let Some(store) = state.server.policy_store() else {
+        return false;
+    };
+    match store.load_policies_for_tenant(tenant).await {
+        Ok(rows) => rows.iter().any(|row| {
+            row.policy_id == OPERATOR_MANAGE_POLICIES_POLICY_ID
+                && row.enabled
+                && row.cedar_text.contains(r#"Action::"manage_policies""#)
+        }),
+        Err(error) => {
+            tracing::warn!(
+                tenant,
+                error = %error,
+                "failed to confirm operator manage_policies durable row"
+            );
+            false
+        }
+    }
+}
+
+fn restore_live_tenant_policy(state: &PlatformState, tenant: &str, policy_text: &str) {
+    let reload_result = if policy_text.trim().is_empty() {
+        state.server.authz.remove_tenant(tenant);
+        Ok(())
+    } else {
+        state
+            .server
+            .authz
+            .reload_tenant_policies(tenant, policy_text)
+    };
+    if let Err(error) = reload_result {
+        tracing::error!(
+            tenant,
+            error = %error,
+            "failed to roll back in-memory operator manage_policies after persist failure"
+        );
+        return;
+    }
+
+    let mut policies = state
+        .server
+        .tenant_policies
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if policy_text.trim().is_empty() {
+        policies.remove(tenant);
+    } else {
+        policies.insert(tenant.to_string(), policy_text.to_string());
+    }
 }
 
 #[cfg(test)]

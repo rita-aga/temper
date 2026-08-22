@@ -5,6 +5,8 @@
 //! idempotent, and that OS-app Cedar still loads.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -20,6 +22,7 @@ use temper_server::StorageStack;
 use temper_server::identity::hash_token;
 use temper_server::request_context::AgentContext;
 use temper_server::state::PendingDecision;
+use temper_server::storage::{PolicyStore, PolicyStoreRow};
 use temper_store_turso::TursoEventStore;
 use tower::ServiceExt;
 
@@ -127,6 +130,86 @@ async fn issue_developer_credential(state: &PlatformState, tenant: &str, plainte
 fn statement_occurrences(haystack: &str, tenant: &str) -> usize {
     let needle = format!(r#"resource == PolicySet::"{tenant}""#);
     haystack.matches(&needle).count()
+}
+
+const SEEDED_LOG: &str = "operator manage_policies Cedar permit seeded";
+const PERSIST_FAILURE_LOG: &str = "operator manage_policies Cedar permit not persisted";
+
+/// `PolicyStore` that rejects every write so San's persist-failure replay
+/// can force `persist_and_activate_policy` to return `false`.
+struct RejectingPolicyStore;
+
+#[async_trait::async_trait]
+impl PolicyStore for RejectingPolicyStore {
+    async fn save_policy(
+        &self,
+        _tenant: &str,
+        _policy_id: &str,
+        _cedar_text: &str,
+        _created_by: &str,
+    ) -> Result<bool, String> {
+        Err("forced save_policy failure".into())
+    }
+
+    async fn load_policies_for_tenant(&self, _tenant: &str) -> Result<Vec<PolicyStoreRow>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn load_all_policies(&self) -> Result<Vec<PolicyStoreRow>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn toggle_policy_enabled(
+        &self,
+        _tenant: &str,
+        _policy_id: &str,
+        _enabled: bool,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    async fn update_policy_text(
+        &self,
+        _tenant: &str,
+        _policy_id: &str,
+        _cedar_text: &str,
+        _created_by: &str,
+    ) -> Result<bool, String> {
+        Err("forced save_policy failure".into())
+    }
+
+    async fn delete_policy(&self, _tenant: &str, _policy_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log buffer lock")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn captured_logs(buffer: &LogBuffer) -> String {
+    String::from_utf8_lossy(&buffer.0.lock().expect("log buffer lock")).into_owned()
 }
 
 #[tokio::test]
@@ -475,5 +558,117 @@ async fn denied_developer_cannot_self_approve_operator_can() {
             .unwrap_or_default()
             .contains(r#"Action::"Assign""#),
         "{approved}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn persist_failure_save_policy_err_does_not_claim_seeded() {
+    let tenant = "acme";
+    let temp = tempfile::tempdir().expect("temp persist-failure db");
+    let db_url = format!("file:{}", temp.path().join("policy.db").display());
+    let store = TursoEventStore::new(&db_url, None)
+        .await
+        .expect("create turso store");
+
+    let mut state = virgin_state(tenant);
+    let mut stack = StorageStack::from_turso(store.clone());
+    stack.policies = Some(Arc::new(RejectingPolicyStore));
+    state.server.set_storage_stack(stack);
+
+    let logs = LogBuffer(Arc::new(Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    bootstrap_operator_credential(&state, OPERATOR_KEY, tenant).await;
+
+    let output = captured_logs(&logs);
+    assert!(
+        !output.contains(SEEDED_LOG),
+        "persist failure must not log success: {output}"
+    );
+    assert!(
+        output.contains(PERSIST_FAILURE_LOG),
+        "persist failure must fail loudly: {output}"
+    );
+
+    let operator = SecurityContext::from_resolved_identity("operator", "operator", None);
+    let live = authorize_manage_policies(&state, tenant, &operator);
+    assert!(
+        !live.is_allowed(),
+        "save_policy Err must not leave a process-local manage_policies grant, got {live:?}"
+    );
+
+    let rows = store
+        .load_policies_for_tenant(tenant)
+        .await
+        .expect("load policies from the real store");
+    assert!(
+        rows.iter().all(|row| row.policy_id != POLICY_ID),
+        "forced save_policy Err must not write the bootstrap row: {rows:?}"
+    );
+
+    let recovered = PlatformState::new(None);
+    recover_cedar_policies(&recovered, &store).await;
+    let after_restart = authorize_manage_policies(&recovered, tenant, &operator);
+    assert!(
+        !after_restart.is_allowed(),
+        "restart recovery must not invent manage_policies when the row was never written, got {after_restart:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn persist_failure_no_policy_store_does_not_claim_seeded() {
+    let tenant = "acme";
+    let state = virgin_state(tenant);
+
+    let logs = LogBuffer(Arc::new(Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    bootstrap_operator_credential(&state, OPERATOR_KEY, tenant).await;
+
+    let output = captured_logs(&logs);
+    assert!(
+        !output.contains(SEEDED_LOG),
+        "no policy_store must not log success: {output}"
+    );
+    assert!(
+        output.contains(PERSIST_FAILURE_LOG),
+        "no policy_store must fail loudly: {output}"
+    );
+    assert!(
+        output.contains("no durable policy store"),
+        "no policy_store log must name the missing store: {output}"
+    );
+
+    // Restart with a virgin durable store: recovery sees no row.
+    let temp = tempfile::tempdir().expect("temp restart db");
+    let db_url = format!("file:{}", temp.path().join("policy.db").display());
+    let store = TursoEventStore::new(&db_url, None)
+        .await
+        .expect("create turso store");
+    let recovered = PlatformState::new(None);
+    recover_cedar_policies(&recovered, &store).await;
+
+    let rows = store
+        .load_policies_for_tenant(tenant)
+        .await
+        .expect("load policies after restart");
+    assert!(
+        rows.iter().all(|row| row.policy_id != POLICY_ID),
+        "no policy_store boot must not leave operator-bootstrap-manage-policies: {rows:?}"
+    );
+
+    let operator = SecurityContext::from_resolved_identity("operator", "operator", None);
+    let after_restart = authorize_manage_policies(&recovered, tenant, &operator);
+    assert!(
+        !after_restart.is_allowed(),
+        "restart without a persisted row must not grant manage_policies, got {after_restart:?}"
     );
 }
