@@ -407,3 +407,35 @@ fn llmobs_tool_parent_prefers_workflow_span_id() {
         Some(("trace-1".to_string(), "workflow-parent".to_string()))
     );
 }
+
+#[tokio::test]
+async fn wasm_authz_denial_records_calling_agent_not_module_label() {
+    let state = crate::state::ServerState::from_registry(
+        temper_runtime::ActorSystem::new("wasm-denial-identity"),
+        crate::registry::SpecRegistry::new(),
+    );
+    let mut rx = state.pending_decision_tx.subscribe();
+    let tenant = TenantId::new("default");
+    let agent_ctx = AgentContext {
+        agent_id: Some("developer-inst-1".to_string()),
+        agent_type: Some("developer".to_string()),
+        ..AgentContext::default()
+    };
+    let decision_id = state.record_wasm_authz_denial(
+        WasmEntityRef {
+            tenant: &tenant,
+            entity_type: "Order",
+            entity_id: "order-1",
+        },
+        "Charge",
+        "payments",
+        "stripe_charge",
+        "authorization denied for http_call: manage_wasm",
+        &agent_ctx,
+    );
+    assert!(decision_id.is_some());
+    let pd = rx.recv().await.expect("WASM denial should broadcast");
+    assert_eq!(pd.agent_id, "developer-inst-1");
+    assert_eq!(pd.agent_type.as_deref(), Some("developer"));
+    assert_ne!(pd.agent_id, "wasm-module");
+}

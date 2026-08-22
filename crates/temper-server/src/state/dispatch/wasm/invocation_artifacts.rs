@@ -12,6 +12,27 @@ use temper_runtime::scheduler::{sim_now, sim_uuid};
 use temper_runtime::tenant::TenantId;
 use tracing::{Instrument, instrument};
 
+/// Identity of the agent whose dispatch triggered a WASM denial.
+///
+/// Same attribution trajectory already records (`agent_ctx.agent_id` /
+/// `agent_type`). A hardcoded module label made the self-resolution ban
+/// compare callers to `"wasm-module"` instead of the denied principal.
+fn wasm_denied_principal(agent_ctx: &AgentContext) -> (String, Option<String>) {
+    let agent_id = agent_ctx.agent_id.clone().or_else(|| {
+        agent_ctx
+            .security_ctx
+            .as_ref()
+            .map(|ctx| ctx.principal.id.clone())
+    });
+    let agent_type = agent_ctx.agent_type.clone().or_else(|| {
+        agent_ctx
+            .security_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.principal.agent_type.clone())
+    });
+    (agent_id.unwrap_or_default(), agent_type)
+}
+
 impl crate::state::ServerState {
     /// Record a WASM invocation (persist log entry + emit observability events).
     #[allow(clippy::too_many_arguments)]
@@ -211,9 +232,14 @@ impl crate::state::ServerState {
         error_str: &str,
         agent_ctx: &AgentContext,
     ) -> Option<String> {
-        let pd = PendingDecision::from_denial(
+        let (denied_agent_id, denied_agent_type) = wasm_denied_principal(agent_ctx);
+        debug_assert!(
+            !denied_agent_id.is_empty(),
+            "WASM denial must attribute the calling agent"
+        );
+        let mut pd = PendingDecision::from_denial(
             entity_ref.tenant.as_str(),
-            "wasm-module",
+            &denied_agent_id,
             "http_call",
             "HttpEndpoint",
             integration_name,
@@ -226,6 +252,8 @@ impl crate::state::ServerState {
             error_str,
             Some(module_name.to_string()),
         );
+        pd.agent_type = denied_agent_type;
+        pd.principal_kind = Some("Agent".to_string());
         let decision_id = pd.id.clone();
         let _ = self.pending_decision_tx.send(pd.clone());
         // Tell the Observe UI a new decision exists so the Decisions tab refreshes live.
@@ -244,7 +272,7 @@ impl crate::state::ServerState {
         let gd_id = format!("GD-{}", sim_uuid());
         let dispatch_ctx = AgentContext::for_service_inheriting("wasm-runtime", agent_ctx);
         let gd_params = serde_json::json!({
-            "tenant": entity_ref.tenant.as_str(), "agent_id": "wasm-module",
+            "tenant": entity_ref.tenant.as_str(), "agent_id": denied_agent_id,
             "action_name": "http_call", "resource_type": "HttpEndpoint",
             "resource_id": integration_name, "denial_reason": error_str,
             "scope": "narrow", "pending_decision_id": decision_id,
@@ -321,5 +349,39 @@ impl crate::state::ServerState {
         }
         self.enqueue_trajectory_entry(traj);
         Some(decision_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::request_context::AgentContext;
+
+    #[test]
+    fn wasm_denied_principal_uses_calling_agent_not_module_label() {
+        let ctx = AgentContext {
+            agent_id: Some("developer-inst-1".to_string()),
+            agent_type: Some("developer".to_string()),
+            ..AgentContext::default()
+        };
+        let (id, ty) = wasm_denied_principal(&ctx);
+        assert_eq!(id, "developer-inst-1");
+        assert_eq!(ty.as_deref(), Some("developer"));
+        assert_ne!(id, "wasm-module");
+    }
+
+    #[test]
+    fn wasm_denied_principal_falls_back_to_security_context() {
+        let ctx = AgentContext {
+            security_ctx: Some(temper_authz::SecurityContext::from_resolved_identity(
+                "caller-9",
+                "developer",
+                None,
+            )),
+            ..AgentContext::default()
+        };
+        let (id, ty) = wasm_denied_principal(&ctx);
+        assert_eq!(id, "caller-9");
+        assert_eq!(ty.as_deref(), Some("developer"));
     }
 }

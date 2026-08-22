@@ -712,6 +712,72 @@ async fn tenant_decision_list_allows_agent_to_read_owned_pending_decisions() {
 }
 
 #[tokio::test]
+async fn tenant_decision_list_manage_policies_agent_sees_other_pending_decisions() {
+    let state = test_state_with_turso().await;
+    state
+        .authz
+        .reload_tenant_policies(
+            "default",
+            r#"
+permit(
+  principal is Agent,
+  action == Action::"manage_policies",
+  resource is PolicySet
+) when {
+  principal.agent_type == "operator" &&
+  principal.agentTypeVerified == true
+};
+"#,
+        )
+        .expect("operator manage_policies policy should parse");
+
+    let owned = crate::state::PendingDecision::from_denial(
+        "default",
+        "developer",
+        "Assign",
+        "Issue",
+        "issue-1",
+        serde_json::json!({"id": "issue-1"}),
+        "developer denial",
+        None,
+    );
+    let owned_id = owned.id.clone();
+    state
+        .persist_pending_decision(&owned)
+        .await
+        .expect("persist developer pending decision");
+
+    let app = build_app_with_state(state);
+    let response = app
+        .oneshot(with_security_context(
+            Request::get("/api/tenants/default/decisions?status=pending")
+                .header("X-Tenant-Id", "default")
+                .body(Body::empty())
+                .unwrap(),
+            temper_authz::SecurityContext::from_resolved_identity("operator", "operator", None),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decision list JSON");
+    let empty = Vec::new();
+    let ids: Vec<&str> = json["decisions"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&owned_id.as_str()),
+        "operator Agent with manage_policies must see another agent's PD: {json}"
+    );
+}
+
+#[tokio::test]
 async fn batch_file_text_read_returns_projected_file_contents_in_request_order() {
     let state = test_state_with_turso().await;
     install_admin_file_read_policy(&state);
@@ -1321,6 +1387,98 @@ permit(
         operator_approve.status(),
         StatusCode::OK,
         "a different principal with manage_policies must still approve"
+    );
+}
+
+#[tokio::test]
+async fn wasm_denial_denied_agent_cannot_approve_even_with_manage_policies() {
+    let state = test_state_with_turso().await;
+    state
+        .authz
+        .reload_tenant_policies(
+            "default",
+            r#"
+permit(
+  principal is Agent,
+  action == Action::"manage_policies",
+  resource is PolicySet
+);
+permit(
+  principal is Admin,
+  action == Action::"manage_policies",
+  resource is PolicySet
+);
+"#,
+        )
+        .expect("manage_policies policy should parse");
+
+    let agent_ctx = crate::request_context::AgentContext {
+        agent_id: Some("developer-inst-1".to_string()),
+        agent_type: Some("developer".to_string()),
+        ..crate::request_context::AgentContext::default()
+    };
+    let denied_id = agent_ctx
+        .agent_id
+        .clone()
+        .expect("WASM denial attributes the calling agent");
+    let mut pending = crate::state::PendingDecision::from_denial(
+        "default",
+        &denied_id,
+        "http_call",
+        "HttpEndpoint",
+        "payments",
+        serde_json::json!({"module": "stripe_charge"}),
+        "authorization denied for http_call",
+        Some("stripe_charge".to_string()),
+    );
+    pending.agent_type = agent_ctx.agent_type.clone();
+    assert_ne!(pending.agent_id, "wasm-module");
+    let decision_id = pending.id.clone();
+    state
+        .persist_pending_decision(&pending)
+        .await
+        .expect("persist WASM-style pending decision");
+
+    let app = build_app_with_state(state);
+    let approve_body = r#"{"scope":{"principal":"this_agent","action":"this_action","resource":"this_resource","duration":"always"}}"#;
+    let self_approve = app
+        .clone()
+        .oneshot(with_security_context(
+            Request::post(format!(
+                "/api/tenants/default/decisions/{decision_id}/approve"
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(approve_body))
+            .unwrap(),
+            temper_authz::SecurityContext::from_resolved_identity(
+                "developer-inst-1",
+                "developer",
+                None,
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        self_approve.status(),
+        StatusCode::FORBIDDEN,
+        "denied WASM caller must not approve their own decision"
+    );
+
+    let operator_approve = app
+        .oneshot(admin_request(
+            Request::post(format!(
+                "/api/tenants/default/decisions/{decision_id}/approve"
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from(approve_body))
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        operator_approve.status(),
+        StatusCode::OK,
+        "operator must still approve a WASM denial"
     );
 }
 

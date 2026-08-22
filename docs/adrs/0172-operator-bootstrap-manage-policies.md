@@ -113,18 +113,51 @@ permit and a different decision.
 ### Sub-Decision 5: Denied principal cannot resolve their own decision
 
 After `manage_policies` succeeds, `POST .../decisions/{id}/approve` and
-`POST .../decisions/{id}/deny` compare `security_context.principal.id` to
-`PendingDecision.agent_id`. On match, return 403 and do not change the
-decision or Cedar.
+`POST .../decisions/{id}/deny` reject the caller when they are the denied
+agent. 403. The decision and Cedar do not change.
+
+The denied agent is the subject of the denial, not a credential handle:
+
+- `PendingDecision.agent_id` is that principal — the same identity
+  trajectory already records (`agent_ctx.agent_id` / resolved
+  `principal.id`). WASM denials must store this, not a hardcoded
+  `"wasm-module"` label. A label makes the ban compare the caller to a
+  module name, so the denied agent with `manage_policies` can approve.
+- When `PendingDecision.agent_type` is present, the ban also matches
+  `principal.agent_type`. `principal.id` is `agent_instance_id` (ADR-0033).
+  A second `AgentCredential` for the same agent mints a new instance id
+  and would walk through an instance-only compare.
 
 This is not Cedar. An agent who was granted `manage_policies` still cannot
-approve themselves into power. A verified operator who is **not** the
-denied principal can approve.
+approve themselves into power, including from a freshly minted key.
+A verified operator who is **not** the denied agent can approve.
 
 **Why this approach**: the missing operator door and the self-approval
 ban are different failures. Cedar grants the governance door; the
 approve/deny handlers refuse to let the subject of the denial walk
 through it for that decision.
+
+### Sub-Decision 6: `manage_policies` sees the tenant decision list
+
+`GET /api/tenants/{tenant}/decisions` is how `temper decide` finds work.
+A principal who is allowed `manage_policies` on that tenant's `PolicySet`
+receives the tenant's pending decisions (Full), not only rows whose
+`agent_id` equals their own principal id.
+
+Agents without that permit still receive only their own decisions
+(Owned). Callers who are neither an Agent nor allowed `manage_policies`
+are denied. This is not permit-all.
+
+An earlier implementation returned Owned for every `PrincipalKind::Agent`
+before Cedar was consulted. The bootstrapped operator is an Agent whose
+id is `"operator"`, so the list hid every other agent's pending
+decision and `temper decide` spun on "Waiting for pending decisions...".
+GET-by-id was already Full-or-owner and stayed that way.
+
+**Why this approach**: listing is the operator's view of the governance
+queue. The same Cedar door that unlocks approve/deny must unlock that
+view. Owned remains the default so a denied agent cannot enumerate
+everyone else's denials.
 
 ## Rollout Plan
 
